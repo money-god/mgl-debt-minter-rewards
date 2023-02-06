@@ -5,9 +5,35 @@ abstract contract TokenLike {
     function transfer(address, uint256) virtual external returns (bool);
 }
 abstract contract RewardDripperLike {
-    function dripReward() virtual external;
+    function dripReward(address) virtual external;
     function rewardPerBlock() virtual external view returns (uint256);
     function rewardToken() virtual external view returns (TokenLike);
+}
+
+abstract contract SafeEngineLike {
+    function canModifySAFE(address,address) external virtual view returns (bool);
+}
+
+// Stores tokens, owned by DebtRewards
+contract TokenPool {
+    TokenLike public immutable token;
+    address   public immutable owner;
+
+    constructor(address token_) public {
+        token = TokenLike(token_);
+        owner = msg.sender;
+    }
+
+    // @notice Transfers tokens from the pool (callable by owner only)
+    function transfer(address to, uint256 wad) public {
+        require(msg.sender == owner, "unauthorized");
+        require(token.transfer(to, wad), "TokenPool/failed-transfer");
+    }
+
+    // @notice Returns token balance of the pool
+    function balance() public view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
 }
 
 // @notice Do not use tokens with transfer callbacks with this contract
@@ -25,46 +51,22 @@ contract DebtRewards {
     // The amount of tokens inneligible for claiming rewards (see formula below)
     mapping(address => uint256) internal rewardDebt;
     // Pending reward = (descendant.balanceOf(user) * accTokensPerShare) - rewardDebt[user]    
+    mapping(address => uint256) internal rewardPendingPayment;
+    // Rewwards to be paid for each safe
 
+    //  SafeEngine
+    SafeEngineLike    immutable public safeEngine;
     // Contract that drips rewards
     RewardDripperLike immutable public rewardDripper;        
-    // Reward Token
-    TokenLike         immutable public rewardToken;       
+    // Reward Pool
+    TokenPool         immutable public rewardPool;      
+    // Tokens accrued by users, pending pull withdraw
+    TokenPool         immutable public userPool;   
 
     // --- Events ---
-    event AddAuthorization(address account);
-    event RemoveAuthorization(address account);
     event DebtSet(address indexed safe, uint256 amount);
     event RewardsPaid(address account, uint256 amount);
     event PoolUpdated(uint256 accTokensPerShare, uint256 stakedSupply);    
-
-    // --- Auth ---
-    mapping (address => uint) public authorizedAccounts;
-    /**
-     * @notice Add auth to an account
-     * @param account Account to add auth to
-     */
-    function addAuthorization(address account) virtual external isAuthorized {
-        authorizedAccounts[account] = 1;
-        emit AddAuthorization(account);
-    }
-
-    /**
-     * @notice Remove auth from an account
-     * @param account Account to remove auth from
-     */
-    function removeAuthorization(address account) virtual external isAuthorized {
-        authorizedAccounts[account] = 0;
-        emit RemoveAuthorization(account);
-    }
-
-    /**
-    * @notice Checks whether msg.sender can call an authed function
-    **/
-    modifier isAuthorized {
-        require(authorizedAccounts[msg.sender] == 1, "DebtRewards/account-not-authorized");
-        _;
-    }
 
     // --- Math ---
     uint256 public constant WAD = 10 ** 18;
@@ -81,15 +83,16 @@ contract DebtRewards {
     }
 
     constructor(
+        address safeEngine_,
         address rewardDripper_
     ) public {
         require(rewardDripper_ != address(0), "DebtRewards/null-reward-dripper");
+        require(safeEngine_ != address(0), "DebtRewards/null-safe-engine");
 
+        safeEngine    = SafeEngineLike(safeEngine_);
         rewardDripper = RewardDripperLike(rewardDripper_);
-        rewardToken   = RewardDripperLike(rewardDripper_).rewardToken();
-
-        authorizedAccounts[msg.sender] = 1;
-        emit AddAuthorization(msg.sender);
+        rewardPool    = new TokenPool(address(RewardDripperLike(rewardDripper_).rewardToken()));
+        userPool      = new TokenPool(address(RewardDripperLike(rewardDripper_).rewardToken()));
     }
 
     /*
@@ -114,18 +117,21 @@ contract DebtRewards {
 
     // --- Core Logic ---
     /*
-    * @notify Updates the pool and pays rewards (if any)
+    * @notice Updates the pool and pays rewards (if any)
     * @dev Must be included in deposits and withdrawals
+    * @param who Account for whom to recompute the rewards
     */
-    modifier payRewards(address who) {
+    modifier computeRewards(address who) {
         updatePool();
 
-        if (debtBalanceOf[who] > 0 && rewardToken.balanceOf(address(this)) > 0) {
+        if (debtBalanceOf[who] > 0 && rewardPool.balance() > 0) {
             // Pays the reward
             uint256 pending = subtract(multiply(debtBalanceOf[who], accTokensPerShare) / RAY, rewardDebt[who]);
 
-            require(rewardToken.transfer(who, pending), "DebtRewards/could-not-transfer-reward-token");
-            rewardsBalance = rewardToken.balanceOf(address(this));
+            rewardPool.transfer(address(userPool), pending);
+            rewardPendingPayment[who] = addition(rewardPendingPayment[who], pending);
+
+            rewardsBalance = rewardPool.balance();
 
             emit RewardsPaid(who, pending);
         }
@@ -134,19 +140,34 @@ contract DebtRewards {
     }
 
     /*
-    * @notify Pays outstanding rewards to msg.sender
+    * @notice Pays outstanding rewards to msg.sender
     */
-    function getRewards() external payRewards(msg.sender) {}
-
-    /*
-    * @notify Pull funds from the dripper
-    */
-    function pullFunds() public {
-        rewardDripper.dripReward();
+    function getRewards() external computeRewards(msg.sender) {
+        userPool.transfer(msg.sender, rewardPendingPayment[msg.sender]);
+        rewardPendingPayment[msg.sender] = 0;
     }
 
     /*
-    * @notify Updates pool data
+    * @notice Pays outstanding rewards to a user set as param
+    * @dev Any address authed on safeEngine to manage the safe can call this funcion
+    * @param from Account from witch to claim rewards
+    * @param to Address rewards will be sent to
+    */
+    function getRewards(address from, address to) external computeRewards(from) {
+        require(safeEngine.canModifySAFE(from, msg.sender), "DebtRewards/unauthed");
+        userPool.transfer(to, rewardPendingPayment[from]);
+        rewardPendingPayment[from] = 0;
+    }    
+
+    /*
+    * @notice Pull funds from the dripper
+    */
+    function pullFunds() public {
+        rewardDripper.dripReward(address(rewardPool));
+    }
+
+    /*
+    * @notice Updates pool data
     */
     function updatePool() public {
         if (block.number <= lastRewardBlock) return;
@@ -154,7 +175,7 @@ contract DebtRewards {
         if (totalDebt == 0) return;
 
         pullFunds();
-        uint256 increaseInBalance = subtract(rewardToken.balanceOf(address(this)), rewardsBalance);
+        uint256 increaseInBalance = subtract(rewardPool.balance(), rewardsBalance);
         rewardsBalance = addition(rewardsBalance, increaseInBalance);
 
         // Updates distribution info
@@ -163,12 +184,13 @@ contract DebtRewards {
     }
 
     /*
-    * @notify Set a safe debt
+    * @notice Set a safe debt
     * @param who Owner of the safe
     * @param wad Current debt of the safe
     * @dev Only safeEngine can call this function
     */
-    function setDebt(address who, uint256 wad) external payRewards(who) isAuthorized {
+    function setDebt(address who, uint256 wad) external computeRewards(who) {
+        require(msg.sender == address(safeEngine), "DebtRewards/unauthed");
         if (debtBalanceOf[who] > wad)
             totalDebt = subtract(totalDebt, debtBalanceOf[who] - wad);
         else
