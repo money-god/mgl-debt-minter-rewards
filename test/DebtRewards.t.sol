@@ -7,10 +7,15 @@ import "../src/DebtRewards.sol";
 import {AutoRewardDripper} from "../src/AutoRewardDripper.sol";
 
 contract SAFEEngineMock {
-    DebtRewards immutable rewards;
+    DebtRewards rewards;
+    bool canModifyAllSafes;
 
-    constructor(address rewards_) public {
-        rewards = DebtRewards(rewards_);
+    function toggleCanModifyAllSafes() public { canModifyAllSafes = !canModifyAllSafes; }
+    function canModifySAFE(address, address) external returns (bool) { return canModifyAllSafes; }
+
+    function modifyParameters(bytes32 param, address data) public {
+        if (param == "rewards")
+            rewards = DebtRewards(data);
     }
 
     function setDebt(address who, uint256 wad) external {
@@ -39,12 +44,13 @@ contract DebtRewardsTest is Test {
             rewardTimeline,
             rewardCalculationDelay
         );
-
-        debtRewards = new DebtRewards(address(rewardDripper));
         
-        safeEngine = new SAFEEngineMock(address(debtRewards));
-        debtRewards.addAuthorization(address(safeEngine));
-        debtRewards.addAuthorization(address(this));
+        safeEngine = new SAFEEngineMock();
+
+        debtRewards = new DebtRewards(address(safeEngine), address(rewardDripper));
+
+        safeEngine.modifyParameters("rewards", address(debtRewards));
+        safeEngine.toggleCanModifyAllSafes();
 
         rewardDripper.modifyParameters("requestor", address(debtRewards));
         rewardToken.mint(address(rewardDripper), 10000000 ether);
@@ -54,13 +60,18 @@ contract DebtRewardsTest is Test {
     function test_setup() public {
         assertEq(address(debtRewards.rewardDripper()), address(rewardDripper));
         assertEq(address(debtRewards.rewardPool().token()), address(rewardToken));
-        assertEq(debtRewards.authorizedAccounts(address(this)), 1);
+        assertEq(address(debtRewards.userPool().token()), address(rewardToken));
         assertEq(debtRewards.totalDebt(), 0);
     }
 
+    function test_setup_null_safe_engine() public {
+        vm.expectRevert(bytes("DebtRewards/null-safe-engine"));
+        debtRewards = new DebtRewards(address(0), address(rewardDripper));        
+    }    
+
     function test_setup_null_dripper() public {
         vm.expectRevert(bytes("DebtRewards/null-reward-dripper"));
-        debtRewards = new DebtRewards(address(0));        
+        debtRewards = new DebtRewards(address(safeEngine), address(0));        
     }
 
     function test_set_debt(address who, uint wad, uint wad2) public {
@@ -85,6 +96,7 @@ contract DebtRewardsTest is Test {
 
         // exit
         safeEngine.setDebt(who, 0);
+        debtRewards.getRewards(who, who);
 
         assertTrue(rewardToken.balanceOf(address(who)) >= previousBalance + (blockDelay * rewardPerBlock) - 1);
         assertEq(debtRewards.debtBalanceOf(who), 0);
@@ -112,6 +124,9 @@ contract DebtRewardsTest is Test {
         assertEq(debtRewards.debtBalanceOf(user1), 0);
         safeEngine.setDebt(user2, 0);
         assertEq(debtRewards.debtBalanceOf(user2), 0);
+
+        debtRewards.getRewards(user1, user1);
+        debtRewards.getRewards(user2, user2);
         
         assertTrue(rewardToken.balanceOf(address(user1)) >= previousBalance1 + 16 * rewardPerBlock -1);
         assertTrue(rewardToken.balanceOf(address(user1)) <= previousBalance1 + 16 * rewardPerBlock +1);
@@ -159,7 +174,8 @@ contract DebtRewardsTest is Test {
 
         vm.roll(block.number + 32); // 32 blocks
         uint previousBalance = rewardToken.balanceOf(address(user1));
-        safeEngine.setDebt(user1, 0);           
+        safeEngine.setDebt(user1, 0);    
+        debtRewards.getRewards(user1, user1);
         
         assertEq(debtRewards.debtBalanceOf(address(user1)), 0);
         assertTrue(rewardToken.balanceOf(address(user1)) >= previousBalance + 20 * rewardPerBlock - 1); // full amount
@@ -217,4 +233,45 @@ contract DebtRewardsTest is Test {
         debtRewards.getRewards();
         assertEq(rewardToken.balanceOf(address(this)), previousBalance + 12 ether); // 1 eth per block, division rounding causes a slight loss of precision
     }
+
+    function testFail_get_rewards_unauthed() public {
+        address who = address(6);
+        // join
+        safeEngine.setDebt(who, 2000 ether);
+
+        vm.roll(block.number + 10);
+        uint previousBalance = rewardToken.balanceOf(who);
+
+        safeEngine.toggleCanModifyAllSafes();
+        debtRewards.getRewards(who, who);
+    }   
+
+    function test_get_rewards_diff_dest() public {
+        uint amount = 10 ether;
+        address user1 = address(1);
+        address user2 = address(2);
+
+        uint rewardPerBlock = rewardDripper.rewardPerBlock();
+
+        vm.roll(block.number + 10);
+
+        debtRewards.updatePool(); // no effect
+
+        // join
+        rewardToken.approve(address(debtRewards), uint(-1));
+        safeEngine.setDebt(user1, amount);
+
+        uint previousBalance = rewardToken.balanceOf(address(user1));
+
+        vm.roll(block.number + 10); // 10 blocks
+
+        debtRewards.getRewards(user1, user2);
+        assertEq(rewardToken.balanceOf(address(user2)), previousBalance + 20 * rewardPerBlock); // 1 eth per block
+
+        vm.roll(block.number + 8); // 8 blocks
+
+        debtRewards.getRewards(user1, user2);
+        assertTrue(rewardToken.balanceOf(address(user2)) >= previousBalance + 28 * rewardPerBlock - 1); // 1 eth per block, division rounding causes a slight loss of precision
+        assertEq(rewardToken.balanceOf(address(user1)), 0); 
+    }         
 }
