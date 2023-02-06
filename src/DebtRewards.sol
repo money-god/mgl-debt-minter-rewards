@@ -5,9 +5,31 @@ abstract contract TokenLike {
     function transfer(address, uint256) virtual external returns (bool);
 }
 abstract contract RewardDripperLike {
-    function dripReward() virtual external;
+    function dripReward(address) virtual external;
     function rewardPerBlock() virtual external view returns (uint256);
     function rewardToken() virtual external view returns (TokenLike);
+}
+
+// Stores tokens, owned by DebtRewards
+contract TokenPool {
+    TokenLike public immutable token;
+    address   public immutable owner;
+
+    constructor(address token_) public {
+        token = TokenLike(token_);
+        owner = msg.sender;
+    }
+
+    // @notice Transfers tokens from the pool (callable by owner only)
+    function transfer(address to, uint256 wad) public {
+        require(msg.sender == owner, "unauthorized");
+        require(token.transfer(to, wad), "TokenPool/failed-transfer");
+    }
+
+    // @notice Returns token balance of the pool
+    function balance() public view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
 }
 
 // @notice Do not use tokens with transfer callbacks with this contract
@@ -28,8 +50,8 @@ contract DebtRewards {
 
     // Contract that drips rewards
     RewardDripperLike immutable public rewardDripper;        
-    // Reward Token
-    TokenLike         immutable public rewardToken;       
+    // Reward Pool
+    TokenPool         immutable public rewardPool;      
 
     // --- Events ---
     event AddAuthorization(address account);
@@ -86,7 +108,7 @@ contract DebtRewards {
         require(rewardDripper_ != address(0), "DebtRewards/null-reward-dripper");
 
         rewardDripper = RewardDripperLike(rewardDripper_);
-        rewardToken   = RewardDripperLike(rewardDripper_).rewardToken();
+        rewardPool    = new TokenPool(address(RewardDripperLike(rewardDripper_).rewardToken()));
 
         authorizedAccounts[msg.sender] = 1;
         emit AddAuthorization(msg.sender);
@@ -117,15 +139,15 @@ contract DebtRewards {
     * @notify Updates the pool and pays rewards (if any)
     * @dev Must be included in deposits and withdrawals
     */
-    modifier payRewards(address who) {
+    modifier computeRewards(address who) {
         updatePool();
 
-        if (debtBalanceOf[who] > 0 && rewardToken.balanceOf(address(this)) > 0) {
+        if (debtBalanceOf[who] > 0 && rewardPool.balance() > 0) {
             // Pays the reward
             uint256 pending = subtract(multiply(debtBalanceOf[who], accTokensPerShare) / RAY, rewardDebt[who]);
 
-            require(rewardToken.transfer(who, pending), "DebtRewards/could-not-transfer-reward-token");
-            rewardsBalance = rewardToken.balanceOf(address(this));
+            rewardPool.transfer(who, pending);
+            rewardsBalance = rewardPool.balance();
 
             emit RewardsPaid(who, pending);
         }
@@ -136,13 +158,13 @@ contract DebtRewards {
     /*
     * @notify Pays outstanding rewards to msg.sender
     */
-    function getRewards() external payRewards(msg.sender) {}
+    function getRewards() external computeRewards(msg.sender) {}
 
     /*
     * @notify Pull funds from the dripper
     */
     function pullFunds() public {
-        rewardDripper.dripReward();
+        rewardDripper.dripReward(address(rewardPool));
     }
 
     /*
@@ -154,7 +176,7 @@ contract DebtRewards {
         if (totalDebt == 0) return;
 
         pullFunds();
-        uint256 increaseInBalance = subtract(rewardToken.balanceOf(address(this)), rewardsBalance);
+        uint256 increaseInBalance = subtract(rewardPool.balance(), rewardsBalance);
         rewardsBalance = addition(rewardsBalance, increaseInBalance);
 
         // Updates distribution info
@@ -168,7 +190,7 @@ contract DebtRewards {
     * @param wad Current debt of the safe
     * @dev Only safeEngine can call this function
     */
-    function setDebt(address who, uint256 wad) external payRewards(who) isAuthorized {
+    function setDebt(address who, uint256 wad) external computeRewards(who) isAuthorized {
         if (debtBalanceOf[who] > wad)
             totalDebt = subtract(totalDebt, debtBalanceOf[who] - wad);
         else

@@ -53,7 +53,7 @@ contract DebtRewardsTest is Test {
 
     function test_setup() public {
         assertEq(address(debtRewards.rewardDripper()), address(rewardDripper));
-        assertEq(address(debtRewards.rewardToken()), address(rewardToken));
+        assertEq(address(debtRewards.rewardPool().token()), address(rewardToken));
         assertEq(debtRewards.authorizedAccounts(address(this)), 1);
         assertEq(debtRewards.totalDebt(), 0);
     }
@@ -202,7 +202,7 @@ contract DebtRewardsTest is Test {
 
         vm.roll(block.number + 10); // 10 blocks
 
-        rewardToken.mint(address(debtRewards), 10 ether); // manually filling up contract
+        rewardToken.mint(address(debtRewards.rewardPool()), 10 ether); // manually filling up contract
 
         uint previousBalance = rewardToken.balanceOf(address(this));
         debtRewards.getRewards();
@@ -212,7 +212,7 @@ contract DebtRewardsTest is Test {
         debtRewards.pullFunds(); // pulling rewards to contract without updating
 
         vm.roll(block.number + 4);
-        rewardToken.mint(address(debtRewards), 2 ether); // manually filling up contract
+        rewardToken.mint(address(debtRewards.rewardPool()), 2 ether); // manually filling up contract
 
         debtRewards.getRewards();
         assertEq(rewardToken.balanceOf(address(this)), previousBalance + 12 ether); // 1 eth per block, division rounding causes a slight loss of precision
